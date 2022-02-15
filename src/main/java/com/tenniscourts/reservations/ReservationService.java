@@ -1,29 +1,58 @@
 package com.tenniscourts.reservations;
 
+import com.tenniscourts.exceptions.AlreadyExistsEntityException;
 import com.tenniscourts.exceptions.EntityNotFoundException;
-import lombok.AllArgsConstructor;
+import com.tenniscourts.guests.Guest;
+import com.tenniscourts.guests.GuestRepository;
+import com.tenniscourts.schedules.Schedule;
+import com.tenniscourts.schedules.ScheduleRepository;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
+import java.util.Optional;
 
 @Service
-@AllArgsConstructor
 public class ReservationService {
 
     private final ReservationRepository reservationRepository;
-
+    private final GuestRepository guestRepository;
+    private final ScheduleRepository scheduleRepository;
     private final ReservationMapper reservationMapper;
 
+    @Autowired
+    public ReservationService(ReservationRepository reservationRepository, GuestRepository guestRepository, ScheduleRepository scheduleRepository, ReservationMapper reservationMapper) {
+        this.reservationRepository = reservationRepository;
+        this.guestRepository = guestRepository;
+        this.scheduleRepository = scheduleRepository;
+        this.reservationMapper = reservationMapper;
+    }
+
     public ReservationDTO bookReservation(CreateReservationRequestDTO createReservationRequestDTO) {
-        throw new UnsupportedOperationException();
+        Guest guest = handleGuest(guestRepository.findById(createReservationRequestDTO.getGuestId()));
+        Schedule schedule = handleSchedule(scheduleRepository.findById(createReservationRequestDTO.getScheduleId()));
+
+        isScheduleReadyToPlayOnReservations(schedule);
+
+        Reservation reservation = Reservation.builder()
+                .guest(guest)
+                .schedule(schedule)
+                .value(BigDecimal.valueOf(10))
+                .refundValue(BigDecimal.valueOf(10))
+                .reservationStatus(ReservationStatus.READY_TO_PLAY)
+                .build();
+        return reservationMapper.map(reservationRepository.save(reservation));
     }
 
     public ReservationDTO findReservation(Long reservationId) {
-        return reservationRepository.findById(reservationId).map(reservationMapper::map).orElseThrow(() -> {
-            throw new EntityNotFoundException("Reservation not found.");
-        });
+        return handleReservation(reservationRepository.findById(reservationId).map(reservationMapper::map));
+    }
+
+    public List<ReservationDTO> findAllReservations() {
+        return  handleReservation(reservationRepository.findAll());
     }
 
     public ReservationDTO cancelReservation(Long reservationId) {
@@ -31,63 +60,84 @@ public class ReservationService {
     }
 
     private Reservation cancel(Long reservationId) {
-        return reservationRepository.findById(reservationId).map(reservation -> {
-
-            this.validateCancellation(reservation);
-
-            BigDecimal refundValue = getRefundValue(reservation);
-            return this.updateReservation(reservation, refundValue, ReservationStatus.CANCELLED);
-
-        }).orElseThrow(() -> {
+        Optional<Reservation> r = reservationRepository.findById(reservationId);
+        if(r.isPresent()){
+            if (!ReservationStatus.READY_TO_PLAY.equals(r.get().getReservationStatus())) {
+                throw new IllegalArgumentException("Cannot cancel/reschedule because it's not in ready to play status.");
+            }
+            BigDecimal refund = getRefundValue(r.get());
+            return updateReservation(r.get(), refund, ReservationStatus.CANCELLED);
+        }else{
             throw new EntityNotFoundException("Reservation not found.");
-        });
+        }
     }
 
-    private Reservation updateReservation(Reservation reservation, BigDecimal refundValue, ReservationStatus status) {
+    private Reservation updateReservation(Reservation reservation, BigDecimal refund, ReservationStatus status) {
         reservation.setReservationStatus(status);
-        reservation.setValue(reservation.getValue().subtract(refundValue));
-        reservation.setRefundValue(refundValue);
+        reservation.setValue(reservation.getValue().subtract(refund));
+        reservation.setRefundValue(refund);
 
         return reservationRepository.save(reservation);
     }
 
-    private void validateCancellation(Reservation reservation) {
-        if (!ReservationStatus.READY_TO_PLAY.equals(reservation.getReservationStatus())) {
-            throw new IllegalArgumentException("Cannot cancel/reschedule because it's not in ready to play status.");
-        }
-
-        if (reservation.getSchedule().getStartDateTime().isBefore(LocalDateTime.now())) {
-            throw new IllegalArgumentException("Can cancel/reschedule only future dates.");
-        }
-    }
-
     public BigDecimal getRefundValue(Reservation reservation) {
-        long hours = ChronoUnit.HOURS.between(LocalDateTime.now(), reservation.getSchedule().getStartDateTime());
+        long minutes = ChronoUnit.MINUTES.between(LocalDateTime.now(), reservation.getSchedule().getStartDateTime());
 
-        if (hours >= 24) {
+        if (minutes >= 1440L) {
             return reservation.getValue();
+        } else if (minutes >= 720L) {
+            return reservation.getValue().multiply(BigDecimal.valueOf(.75));
+        } else if (minutes >= 120L) {
+            return reservation.getValue().multiply(BigDecimal.valueOf(.5));
+        } else if (minutes > 0L){
+            return reservation.getValue().multiply(BigDecimal.valueOf(.25));
+        } else {
+            return BigDecimal.ZERO;
         }
-
-        return BigDecimal.ZERO;
     }
 
-    /*TODO: This method actually not fully working, find a way to fix the issue when it's throwing the error:
-            "Cannot reschedule to the same slot.*/
     public ReservationDTO rescheduleReservation(Long previousReservationId, Long scheduleId) {
-        Reservation previousReservation = cancel(previousReservationId);
+        Schedule schedule = handleSchedule(scheduleRepository.findById(scheduleId));
 
-        if (scheduleId.equals(previousReservation.getSchedule().getId())) {
-            throw new IllegalArgumentException("Cannot reschedule to the same slot.");
-        }
-
-        previousReservation.setReservationStatus(ReservationStatus.RESCHEDULED);
-        reservationRepository.save(previousReservation);
+        isScheduleReadyToPlayOnReservations(schedule);
+        Reservation previous = cancel(previousReservationId);
+        previous.setReservationStatus(ReservationStatus.RESCHEDULED);
+        reservationRepository.save(previous);
 
         ReservationDTO newReservation = bookReservation(CreateReservationRequestDTO.builder()
-                .guestId(previousReservation.getGuest().getId())
+                .guestId(previous.getGuest().getId())
                 .scheduleId(scheduleId)
                 .build());
-        newReservation.setPreviousReservation(reservationMapper.map(previousReservation));
+        newReservation.setPreviousReservation(reservationMapper.map(previous));
         return newReservation;
     }
+
+    private void isScheduleReadyToPlayOnReservations(Schedule schedule) {
+        List <Reservation> checkExistingReservationsByScheduleID = reservationRepository.findBySchedule_Id(schedule.getId());
+        Optional<ReservationStatus> reservation = checkExistingReservationsByScheduleID.stream().map(r -> r.getReservationStatus()).filter(rez -> rez.equals(ReservationStatus.READY_TO_PLAY)).findFirst();
+        if(reservation.isPresent())
+            throw new AlreadyExistsEntityException("Tennis court booked.");
+
+    }
+
+    private Guest handleGuest(Optional<Guest> guest){
+        return guest.orElseThrow( () -> new EntityNotFoundException("Guest not found"));
+    }
+
+    private Schedule handleSchedule(Optional<Schedule> schedule){
+        return schedule.orElseThrow( () -> new EntityNotFoundException("Schedule not found"));
+    }
+
+    private ReservationDTO handleReservation(Optional<ReservationDTO> reservation){
+        return reservation.orElseThrow( () -> new EntityNotFoundException("Reservation not found"));
+    }
+
+    private List<ReservationDTO> handleReservation( List<Reservation> reservations){
+        if (!reservations.isEmpty()) {
+            return reservationMapper.map(reservations);
+        } else {
+            throw new EntityNotFoundException("Reservations not found");
+        }
+    }
+
 }
